@@ -224,6 +224,7 @@ class Window(DynamicInfo):
 class LabelType(enum.Enum):
   NEGATIVE = 0
   POSITIVE = 1
+  POSSIBLE = 2
 
 
 @dataclasses.dataclass(init=False, repr=False, eq=False)
