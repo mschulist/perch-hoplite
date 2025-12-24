@@ -157,11 +157,14 @@ class AgileDataManager(DataManager):
       evaluation. Note that this is only enforced for positive examples.
     batch_size: The batch size for training.
     weak_negatives_batch_size: The batch size for weak negatives.
+    max_train_examples_per_label: Maximum number of training examples per label.
+      If None, use all available training examples.
     rng: The random number generator to use.
   """
   train_ratio: float
   min_eval_examples: int
   weak_negatives_batch_size: int
+  max_train_examples_per_label: int | None = None
 
   def get_single_label_train_test_split(
       self, label: str
@@ -215,7 +218,16 @@ class AgileDataManager(DataManager):
     # De-dupe the eval_ids, in case there are multiple Labels for the embedding.
     eval_ids = np.unique(eval_ids)
     train_ids = np.setdiff1d(all_ids, eval_ids)
-    return train_ids, eval_ids
+    
+    # Limit training examples if max_train_examples_per_label is set
+    # Any examples beyond the limit are added to eval instead of being discarded
+    if self.max_train_examples_per_label is not None and train_ids.shape[0] > self.max_train_examples_per_label:
+      self.rng.shuffle(train_ids)
+      extra_train_ids = train_ids[self.max_train_examples_per_label:]
+      train_ids = train_ids[:self.max_train_examples_per_label]
+      eval_ids = np.concatenate([eval_ids, extra_train_ids])
+    
+    return train_ids, eval_ids 
 
   def get_train_test_split(self) -> tuple[np.ndarray, np.ndarray]:
     """Create a train/test split over all labels.
