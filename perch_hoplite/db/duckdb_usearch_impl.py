@@ -67,6 +67,7 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
             "annotations": {},
         }
     )
+    _cursor: duckdb.DuckDBPyConnection | None = None
     _ui_loaded: bool = False
     _ui_updated: bool = False
 
@@ -219,6 +220,12 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
         db_path.mkdir(parents=True, exist_ok=True)
         duckdb_path = db_path / DUCKDB_FILENAME
         connection = duckdb.connect(duckdb_path.as_posix())
+
+        # Configure DuckDB for better write performance
+        connection.execute("SET checkpoint_threshold='1GB'")
+        connection.execute("SET wal_autocheckpoint='1GB'")
+        connection.execute("SET memory_limit='4GB'")
+
         cls._setup_tables(connection)
         # Start explicit transaction
         connection.execute("BEGIN TRANSACTION")
@@ -323,7 +330,10 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
     def commit(self) -> None:
         """Commit any pending transactions to the database."""
         self.connection.commit()
-        # Start a new transaction after commit
+        if self._cursor is not None:
+            self._cursor.close()
+            self._cursor = None
+        # Start a new transaction after commit (like SQLite does)
         self.connection.execute("BEGIN TRANSACTION")
         if self._ui_updated:
             self.ui.save()
@@ -333,10 +343,17 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
         """Get a new instance of the DuckDB DB."""
         return self.create(self.db_path.as_posix())
 
+    def _get_cursor(self) -> duckdb.DuckDBPyConnection:
+        """Get the DuckDB cursor (connection for statement reuse)."""
+        if self._cursor is None:
+            self._cursor = self.connection.cursor()
+        return self._cursor
+
     def insert_metadata(self, key: str, value: config_dict.ConfigDict) -> None:
         """Insert a key-value pair into the metadata table."""
         json_coded = value.to_json()
-        self.connection.execute(
+        cursor = self._get_cursor()
+        cursor.execute(
             """
         INSERT INTO hoplite_metadata (key, value)
         VALUES ($1, $2)
@@ -397,9 +414,8 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
     ) -> int:
         """Insert a deployment into the database."""
         # Get next ID from sequence
-        result = self.connection.execute(
-            "SELECT nextval('deployments_id_seq')"
-        ).fetchone()
+        cursor = self._get_cursor()
+        result = cursor.execute("SELECT nextval('deployments_id_seq')").fetchone()
         if result is None:
             raise RuntimeError("Error getting next deployment ID from sequence.")
         deployment_id = result[0]
@@ -412,7 +428,7 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
             longitude=longitude,
             **kwargs,
         )
-        self.connection.execute(
+        cursor.execute(
             f"""
         INSERT INTO deployments {columns_str}
         VALUES {placeholders_str}
@@ -466,9 +482,8 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
     ) -> int:
         """Insert a recording into the database."""
         # Get next ID from sequence
-        result = self.connection.execute(
-            "SELECT nextval('recordings_id_seq')"
-        ).fetchone()
+        cursor = self._get_cursor()
+        result = cursor.execute("SELECT nextval('recordings_id_seq')").fetchone()
         if result is None:
             raise RuntimeError("Error getting next recording ID from sequence.")
         recording_id = result[0]
@@ -480,7 +495,7 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
             deployment_id=deployment_id,
             **kwargs,
         )
-        self.connection.execute(
+        cursor.execute(
             f"""
         INSERT INTO recordings {columns_str}
         VALUES {placeholders_str}
@@ -544,7 +559,8 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
             )
 
         # Get next ID from sequence
-        result = self.connection.execute("SELECT nextval('windows_id_seq')").fetchone()
+        cursor = self._get_cursor()
+        result = cursor.execute("SELECT nextval('windows_id_seq')").fetchone()
         if result is None:
             raise RuntimeError("Error getting next window ID from sequence.")
         window_id = result[0]
@@ -555,7 +571,7 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
             offsets=offsets,
             **kwargs,
         )
-        self.connection.execute(
+        cursor.execute(
             f"""
         INSERT INTO windows {columns_str}
         VALUES {placeholders_str}
