@@ -98,55 +98,55 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
 
         # Create the deployments table.
         connection.execute("""
+        CREATE SEQUENCE IF NOT EXISTS deployments_id_seq START 1
+        """)
+        connection.execute("""
         CREATE TABLE IF NOT EXISTS deployments (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY DEFAULT nextval('deployments_id_seq'),
             name TEXT NOT NULL,
             project TEXT NOT NULL,
             latitude REAL,
             longitude REAL
         )
         """)
-        connection.execute("""
-        CREATE SEQUENCE IF NOT EXISTS deployments_id_seq START 1
-        """)
 
         # Create the recordings table.
         connection.execute("""
+        CREATE SEQUENCE IF NOT EXISTS recordings_id_seq START 1
+        """)
+        connection.execute("""
         CREATE TABLE IF NOT EXISTS recordings (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY DEFAULT nextval('recordings_id_seq'),
             filename TEXT NOT NULL,
             datetime TEXT,
             deployment_id INTEGER
         )
         """)
-        connection.execute("""
-        CREATE SEQUENCE IF NOT EXISTS recordings_id_seq START 1
-        """)
 
         # Create the windows table.
         connection.execute("""
+        CREATE SEQUENCE IF NOT EXISTS windows_id_seq START 1
+        """)
+        connection.execute("""
         CREATE TABLE IF NOT EXISTS windows (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY DEFAULT nextval('windows_id_seq'),
             recording_id INTEGER NOT NULL,
             offsets BLOB NOT NULL
         )
         """)
-        connection.execute("""
-        CREATE SEQUENCE IF NOT EXISTS windows_id_seq START 1
-        """)
 
         # Create the annotations table.
         connection.execute("""
+        CREATE SEQUENCE IF NOT EXISTS annotations_id_seq START 1
+        """)
+        connection.execute("""
         CREATE TABLE IF NOT EXISTS annotations (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY DEFAULT nextval('annotations_id_seq'),
             window_id INTEGER NOT NULL,
             label TEXT NOT NULL,
             label_type INTEGER NOT NULL,
             provenance TEXT NOT NULL
         )
-        """)
-        connection.execute("""
-        CREATE SEQUENCE IF NOT EXISTS annotations_id_seq START 1
         """)
 
         # Create the metadata table.
@@ -413,29 +413,25 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
         **kwargs: Any,
     ) -> int:
         """Insert a deployment into the database."""
-        # Get next ID from sequence
         cursor = self._get_cursor()
-        result = cursor.execute("SELECT nextval('deployments_id_seq')").fetchone()
-        if result is None:
-            raise RuntimeError("Error getting next deployment ID from sequence.")
-        deployment_id = result[0]
-
         columns_str, placeholders_str, values = format_sql_insert_values(
-            id=deployment_id,
             name=name,
             project=project,
             latitude=latitude,
             longitude=longitude,
             **kwargs,
         )
-        cursor.execute(
+        result = cursor.execute(
             f"""
         INSERT INTO deployments {columns_str}
         VALUES {placeholders_str}
+        RETURNING id
         """,
             values,
-        )
-        return deployment_id
+        ).fetchone()
+        if result is None:
+            raise RuntimeError("Error inserting deployment into the database.")
+        return result[0]
 
     def get_deployment(self, deployment_id: int) -> interface.Deployment:
         """Get a deployment from the database."""
@@ -481,28 +477,24 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
         **kwargs: Any,
     ) -> int:
         """Insert a recording into the database."""
-        # Get next ID from sequence
         cursor = self._get_cursor()
-        result = cursor.execute("SELECT nextval('recordings_id_seq')").fetchone()
-        if result is None:
-            raise RuntimeError("Error getting next recording ID from sequence.")
-        recording_id = result[0]
-
         columns_str, placeholders_str, values = format_sql_insert_values(
-            id=recording_id,
             filename=filename,
             datetime=datetime,
             deployment_id=deployment_id,
             **kwargs,
         )
-        cursor.execute(
+        result = cursor.execute(
             f"""
         INSERT INTO recordings {columns_str}
         VALUES {placeholders_str}
+        RETURNING id
         """,
             values,
-        )
-        return recording_id
+        ).fetchone()
+        if result is None:
+            raise RuntimeError("Error inserting recording into the database.")
+        return result[0]
 
     def get_recording(self, recording_id: int) -> interface.Recording:
         """Get a recording from the database."""
@@ -558,26 +550,23 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
                 f" got {embedding.shape[-1]}."
             )
 
-        # Get next ID from sequence
         cursor = self._get_cursor()
-        result = cursor.execute("SELECT nextval('windows_id_seq')").fetchone()
-        if result is None:
-            raise RuntimeError("Error getting next window ID from sequence.")
-        window_id = result[0]
-
         columns_str, placeholders_str, values = format_sql_insert_values(
-            id=window_id,
             recording_id=recording_id,
             offsets=offsets,
             **kwargs,
         )
-        cursor.execute(
+        result = cursor.execute(
             f"""
         INSERT INTO windows {columns_str}
         VALUES {placeholders_str}
+        RETURNING id
         """,
             values,
-        )
+        ).fetchone()
+        if result is None:
+            raise RuntimeError("Error inserting window into the database.")
+        window_id = result[0]
         if embedding is not None:
             if not self._ui_loaded:
                 self.ui.load()
@@ -707,30 +696,25 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
             if matches:
                 return matches[0].id
 
-        # Get next ID from sequence
-        result = self.connection.execute(
-            "SELECT nextval('annotations_id_seq')"
-        ).fetchone()
-        if result is None:
-            raise RuntimeError("Error getting next annotation ID from sequence.")
-        annotation_id = result[0]
-
+        cursor = self._get_cursor()
         columns_str, placeholders_str, values = format_sql_insert_values(
-            id=annotation_id,
             window_id=window_id,
             label=label,
             label_type=label_type,
             provenance=provenance,
             **kwargs,
         )
-        self.connection.execute(
+        result = cursor.execute(
             f"""
         INSERT INTO annotations {columns_str}
         VALUES {placeholders_str}
+        RETURNING id
         """,
             values,
-        )
-        return annotation_id
+        ).fetchone()
+        if result is None:
+            raise RuntimeError("Error inserting annotation into the database.")
+        return result[0]
 
     def get_annotation(self, annotation_id: int) -> interface.Annotation:
         """Get an annotation from the database."""
