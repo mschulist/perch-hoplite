@@ -13,7 +13,7 @@ from ml_collections import config_dict
 import numpy as np
 from perch_hoplite.db import interface
 from perch_hoplite.db import sqlite_usearch_impl
-from sqlite_usearch_impl import (
+from perch_hoplite.db.sqlite_usearch_impl import (
     deserialize_array,
     is_valid_sql_identifier,
     format_sql_insert_values,
