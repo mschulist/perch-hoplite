@@ -220,7 +220,8 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
         duckdb_path = db_path / DUCKDB_FILENAME
         connection = duckdb.connect(duckdb_path.as_posix())
         cls._setup_tables(connection)
-        connection.commit()
+        # Start explicit transaction
+        connection.execute("BEGIN TRANSACTION")
 
         # Retrieve the metadata.
         # TODO(tomdenton): Check that `usearch_cfg` is consistent with the DB.
@@ -322,6 +323,8 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
     def commit(self) -> None:
         """Commit any pending transactions to the database."""
         self.connection.commit()
+        # Start a new transaction after commit
+        self.connection.execute("BEGIN TRANSACTION")
         if self._ui_updated:
             self.ui.save()
             self._ui_updated = False
