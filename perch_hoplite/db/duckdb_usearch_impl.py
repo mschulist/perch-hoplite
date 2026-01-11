@@ -537,43 +537,138 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
 
     def insert_window(
         self,
-        recording_id: int,
-        offsets: np.ndarray,
-        embedding: np.ndarray | None = None,
+        recording_id: int | Sequence[int],
+        offsets: np.ndarray | Sequence[np.ndarray],
+        embedding: np.ndarray | Sequence[np.ndarray] | None = None,
         **kwargs: Any,
-    ) -> int:
-        """Insert a window into the database."""
+    ) -> int | list[int]:
+        """Insert one or more windows into the database.
 
-        if embedding is not None and embedding.shape[-1] != self._embedding_dim:
+        Supports both single and vectorized insertion:
+        - Single insertion: Pass single values for recording_id, offsets, and embedding
+        - Vectorized insertion: Pass sequences for recording_id, offsets, and embedding
+
+        Args:
+          recording_id: Single recording ID or sequence of recording IDs.
+          offsets: Single offsets array or sequence of offsets arrays.
+          embedding: Single embedding, sequence of embeddings, or None.
+          **kwargs: Additional keyword arguments. For vectorized insertion, values
+            should be sequences of the same length as the other parameters.
+
+        Returns:
+          Single window ID for single insertion, or list of window IDs for vectorized.
+        """
+        # Check if this is a vectorized insertion
+        is_vectorized = isinstance(recording_id, (list, tuple))
+
+        # Normalize inputs to sequences for uniform processing
+        if not is_vectorized:
+            recording_ids = [recording_id]
+            offsets_list = [offsets]
+            embeddings_list = [embedding] if embedding is not None else None
+            kwargs_lists = {k: [v] for k, v in kwargs.items()}
+        else:
+            recording_ids = recording_id
+            offsets_list = offsets
+            embeddings_list = embedding
+            # Handle kwargs that might be scalar or sequences
+            kwargs_lists = {}
+            for key, value in kwargs.items():
+                if isinstance(value, (list, tuple)):
+                    kwargs_lists[key] = value
+                else:
+                    kwargs_lists[key] = [value] * len(recording_ids)
+
+        # Validate input lengths
+        n_windows = len(recording_ids)
+        if len(offsets_list) != n_windows:
             raise ValueError(
-                f"Incorrect embedding dimension. Expected {self._embedding_dim}, but"
-                f" got {embedding.shape[-1]}."
+                f"Length mismatch: recording_id has {n_windows} elements, "
+                f"but offsets has {len(offsets_list)} elements."
             )
 
+        if embeddings_list is not None:
+            if len(embeddings_list) != n_windows:
+                raise ValueError(
+                    f"Length mismatch: recording_id has {n_windows} elements, "
+                    f"but embedding has {len(embeddings_list)} elements."
+                )
+            # Validate embedding dimensions
+            for i, emb in enumerate(embeddings_list):
+                emb_array = np.asarray(emb)
+                if emb_array.shape[-1] != self._embedding_dim:
+                    raise ValueError(
+                        f"Incorrect embedding dimension at index {i}. "
+                        f"Expected {self._embedding_dim}, but got {emb_array.shape[-1]}."
+                    )
+
+        # Validate kwargs lengths
+        for key, value in kwargs_lists.items():
+            if len(value) != n_windows:
+                raise ValueError(
+                    f"Length mismatch: recording_id has {n_windows} elements, "
+                    f"but kwargs['{key}'] has {len(value)} elements."
+                )
+
         cursor = self._get_cursor()
-        columns_str, placeholders_str, values = format_sql_insert_values(
-            recording_id=recording_id,
-            offsets=offsets,
-            **kwargs,
+
+        # Prepare batch data for executemany
+        batch_values = []
+        for i in range(n_windows):
+            window_kwargs = {k: v[i] for k, v in kwargs_lists.items()}
+            _, _, values = format_sql_insert_values(
+                recording_id=recording_ids[i],
+                offsets=offsets_list[i],
+                **window_kwargs,
+            )
+            batch_values.append(values)
+
+        # Get column info from first window
+        columns_str, placeholders_str, _ = format_sql_insert_values(
+            recording_id=recording_ids[0],
+            offsets=offsets_list[0],
+            **{k: v[0] for k, v in kwargs_lists.items()},
         )
-        result = cursor.execute(
+
+        # Use executemany for batch insert
+        results = cursor.executemany(
             f"""
         INSERT INTO windows {columns_str}
         VALUES {placeholders_str}
         RETURNING id
         """,
-            values,
-        ).fetchone()
-        if result is None:
-            raise RuntimeError("Error inserting window into the database.")
-        window_id = result[0]
-        if embedding is not None:
+            batch_values,
+        ).fetchall()
+
+        if len(results) != n_windows:
+            raise RuntimeError("Error inserting windows into the database.")
+
+        window_ids = [result[0] for result in results]
+
+        # Batch add embeddings to USearch index if provided
+        if embeddings_list is not None:
             if not self._ui_loaded:
                 self.ui.load()
                 self._ui_loaded = True
-            self.ui.add(window_id, embedding.astype(self._embedding_dtype))
+
+            # USearch supports batch add - convert to arrays
+            ids_array = np.array(window_ids, dtype=np.int64)
+            embeddings_array = np.stack(
+                [
+                    np.asarray(emb).astype(self._embedding_dtype)
+                    for emb in embeddings_list
+                ]
+            )
+
+            # Batch add to USearch
+            self.ui.add(ids_array, embeddings_array)
             self._ui_updated = True
-        return window_id
+
+        # Return single ID or list based on input type
+        if not is_vectorized:
+            return window_ids[0]
+        else:
+            return window_ids
 
     def get_window(
         self,
