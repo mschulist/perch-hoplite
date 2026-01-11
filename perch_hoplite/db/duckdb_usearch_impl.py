@@ -542,138 +542,70 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
         embedding: np.ndarray | Sequence[np.ndarray] | None = None,
         **kwargs: Any,
     ) -> int | list[int]:
-        """Insert one or more windows into the database.
-
-        Supports both single and vectorized insertion:
-        - Single insertion: Pass single values for recording_id, offsets, and embedding
-        - Vectorized insertion: Pass sequences for recording_id, offsets, and embedding
-
-        Args:
-          recording_id: Single recording ID or sequence of recording IDs.
-          offsets: Single offsets array or sequence of offsets arrays.
-          embedding: Single embedding, sequence of embeddings, or None.
-          **kwargs: Additional keyword arguments. For vectorized insertion, values
-            should be sequences of the same length as the other parameters.
-
-        Returns:
-          Single window ID for single insertion, or list of window IDs for vectorized.
-        """
-        # Check if this is a vectorized insertion
+        """Insert one or more windows into the database."""
         is_vectorized = isinstance(recording_id, (list, tuple))
 
-        # Normalize inputs to sequences for uniform processing
+        # Normalize to lists
         if not is_vectorized:
-            recording_ids = [recording_id]
-            offsets_list = [offsets]
-            embeddings_list = [embedding] if embedding is not None else None
-            kwargs_lists = {k: [v] for k, v in kwargs.items()}
-        else:
-            recording_ids = recording_id
-            offsets_list = offsets
-            embeddings_list = embedding
-            # Handle kwargs that might be scalar or sequences
-            kwargs_lists = {}
-            for key, value in kwargs.items():
-                if isinstance(value, (list, tuple)):
-                    kwargs_lists[key] = value
-                else:
-                    kwargs_lists[key] = [value] * len(recording_ids)
+            recording_id = [recording_id]  # type: ignore
+            offsets = [offsets]  # type: ignore
+            embedding = [embedding] if embedding is not None else None  # type: ignore
+            kwargs = {k: [v] for k, v in kwargs.items()}
 
-        # Validate input lengths
-        n_windows = len(recording_ids)
-        if len(offsets_list) != n_windows:
-            raise ValueError(
-                f"Length mismatch: recording_id has {n_windows} elements, "
-                f"but offsets has {len(offsets_list)} elements."
-            )
+        n = len(recording_id)  # type: ignore
 
-        if embeddings_list is not None:
-            if len(embeddings_list) != n_windows:
-                raise ValueError(
-                    f"Length mismatch: recording_id has {n_windows} elements, "
-                    f"but embedding has {len(embeddings_list)} elements."
-                )
-            # Validate embedding dimensions
-            for i, emb in enumerate(embeddings_list):
-                emb_array = np.asarray(emb)
-                if emb_array.shape[-1] != self._embedding_dim:
+        # Validate embedding dimensions if provided
+        if embedding is not None:
+            for emb in embedding:
+                if np.asarray(emb).shape[-1] != self._embedding_dim:
                     raise ValueError(
-                        f"Incorrect embedding dimension at index {i}. "
-                        f"Expected {self._embedding_dim}, but got {emb_array.shape[-1]}."
+                        f"Expected embedding dim {self._embedding_dim}, "
+                        f"got {np.asarray(emb).shape[-1]}"
                     )
 
-        # Validate kwargs lengths
-        for key, value in kwargs_lists.items():
-            if len(value) != n_windows:
-                raise ValueError(
-                    f"Length mismatch: recording_id has {n_windows} elements, "
-                    f"but kwargs['{key}'] has {len(value)} elements."
-                )
-
+        # Prepare batch values
         cursor = self._get_cursor()
+        batch = []
+        for i in range(n):
+            kw = {k: v[i] if isinstance(v, list) else v for k, v in kwargs.items()}
+            _, _, vals = format_sql_insert_values(
+                recording_id=recording_id[i],  # type: ignore
+                offsets=offsets[i],  # type: ignore
+                **kw,
+            )
+            batch.append(vals)
 
-        # Get column info from first window
-        columns_str, placeholders_str, _ = format_sql_insert_values(
-            recording_id=recording_ids[0],
-            offsets=offsets_list[0],
-            **{k: v[0] for k, v in kwargs_lists.items()},
+        # Get INSERT structure from first row
+        cols, placeholders, _ = format_sql_insert_values(
+            recording_id=recording_id[0],  # type: ignore
+            offsets=offsets[0],  # type: ignore
+            **{k: v[0] if isinstance(v, list) else v for k, v in kwargs.items()},
         )
 
-        # Prepare all values for a single multi-row INSERT
-        all_values = []
-        placeholders_list = []
-        for i in range(n_windows):
-            window_kwargs = {k: v[i] for k, v in kwargs_lists.items()}
-            _, _, values = format_sql_insert_values(
-                recording_id=recording_ids[i],
-                offsets=offsets_list[i],
-                **window_kwargs,
-            )
-            all_values.extend(values)
-            placeholders_list.append(placeholders_str)
-
-        # Build multi-row INSERT statement
-        multi_placeholders = ", ".join(placeholders_list)
-
-        # Execute single multi-row insert
+        # Multi-row INSERT with RETURNING
+        all_vals = [v for vals in batch for v in vals]
+        multi_placeholders = ", ".join([placeholders] * n)
         results = cursor.execute(
-            f"""
-        INSERT INTO windows {columns_str}
-        VALUES {multi_placeholders}
-        RETURNING id
-        """,
-            all_values,
+            f"INSERT INTO windows {cols} VALUES {multi_placeholders} RETURNING id",
+            all_vals,
         ).fetchall()
 
-        if len(results) != n_windows:
-            raise RuntimeError("Error inserting windows into the database.")
+        window_ids = [r[0] for r in results]
 
-        window_ids = [result[0] for result in results]
-
-        # Batch add embeddings to USearch index if provided
-        if embeddings_list is not None:
+        # Batch add to USearch if embeddings provided
+        if embedding is not None:
             if not self._ui_loaded:
                 self.ui.load()
                 self._ui_loaded = True
-
-            # USearch supports batch add - convert to arrays
-            ids_array = np.array(window_ids, dtype=np.int64)
-            embeddings_array = np.stack(
-                [
-                    np.asarray(emb).astype(self._embedding_dtype)
-                    for emb in embeddings_list
-                ]
+            self.ui.add(
+                np.array(window_ids, dtype=np.int64),
+                np.stack(
+                    [np.asarray(e).astype(self._embedding_dtype) for e in embedding]
+                ),  # type: ignore
             )
-
-            # Batch add to USearch
-            self.ui.add(ids_array, embeddings_array)
             self._ui_updated = True
 
-        # Return single ID or list based on input type
-        if not is_vectorized:
-            return window_ids[0]
-        else:
-            return window_ids
+        return window_ids[0] if not is_vectorized else window_ids
 
     def get_window(
         self,
