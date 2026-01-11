@@ -612,17 +612,6 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
 
         cursor = self._get_cursor()
 
-        # Prepare batch data for executemany
-        batch_values = []
-        for i in range(n_windows):
-            window_kwargs = {k: v[i] for k, v in kwargs_lists.items()}
-            _, _, values = format_sql_insert_values(
-                recording_id=recording_ids[i],
-                offsets=offsets_list[i],
-                **window_kwargs,
-            )
-            batch_values.append(values)
-
         # Get column info from first window
         columns_str, placeholders_str, _ = format_sql_insert_values(
             recording_id=recording_ids[0],
@@ -630,14 +619,30 @@ class DuckDBUSearchDB(interface.HopliteDBInterface):
             **{k: v[0] for k, v in kwargs_lists.items()},
         )
 
-        # Use executemany for batch insert
-        results = cursor.executemany(
+        # Prepare all values for a single multi-row INSERT
+        all_values = []
+        placeholders_list = []
+        for i in range(n_windows):
+            window_kwargs = {k: v[i] for k, v in kwargs_lists.items()}
+            _, _, values = format_sql_insert_values(
+                recording_id=recording_ids[i],
+                offsets=offsets_list[i],
+                **window_kwargs,
+            )
+            all_values.extend(values)
+            placeholders_list.append(placeholders_str)
+
+        # Build multi-row INSERT statement
+        multi_placeholders = ", ".join(placeholders_list)
+
+        # Execute single multi-row insert
+        results = cursor.execute(
             f"""
         INSERT INTO windows {columns_str}
-        VALUES {placeholders_str}
+        VALUES {multi_placeholders}
         RETURNING id
         """,
-            batch_values,
+            all_values,
         ).fetchall()
 
         if len(results) != n_windows:
