@@ -23,6 +23,7 @@ import datetime as dt
 import itertools
 from typing import Any
 
+from absl import logging
 from ml_collections import config_dict
 import numpy as np
 from perch_hoplite.db import interface
@@ -55,6 +56,7 @@ def select_matching_keys(
       'isin',
       'notin',
       'range',
+      'approx',
   }
   for op_name, op_filters in filter_dict.items():
     if op_name not in supported_ops:
@@ -71,6 +73,11 @@ def select_matching_keys(
         attr = getattr(obj, key, None)
 
         if op_name == 'eq':
+          if key == 'offsets':
+            logging.warning(
+                "Do not apply `eq` to the `offsets` unless you know what you're"
+                ' doing. Apply `approx` instead to avoid floating point errors.'
+            )
           if attr is None:
             if value is not None:
               return False
@@ -133,6 +140,15 @@ def select_matching_keys(
             return False
           if attr < value[0] or attr > value[1]:
             return False
+        elif op_name == 'approx':
+          if attr is None or value is None:
+            return False
+          if key == 'offsets':
+            if not np.allclose(attr, value, rtol=0.0, atol=1e-6):
+              return False
+          else:
+            if abs(attr - value) >= 1e-6:
+              return False
 
     return True
 
@@ -207,6 +223,10 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
     """No-op to commit any pending transactions to the database.."""
     pass
 
+  def rollback(self) -> None:
+    """No-op to rollback any pending transactions to the database."""
+    pass
+
   def thread_split(self) -> 'InMemoryGraphSearchDB':
     """Return the same database object since all data is in shared memory."""
     return self
@@ -255,10 +275,13 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
 
   def get_deployment(self, deployment_id: int) -> interface.Deployment:
     """Get a deployment from the database."""
+    deployment_id = int(deployment_id)
     return self._deployments[deployment_id]
 
   def remove_deployment(self, deployment_id: int) -> None:
     """Remove a deployment from the database."""
+
+    deployment_id = int(deployment_id)
 
     remove_recording_ids = [
         recording.id
@@ -278,6 +301,9 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
   ) -> int:
     """Insert a recording into the database."""
 
+    if deployment_id is not None and deployment_id not in self._deployments:
+      raise ValueError(f'Deployment id not found: {deployment_id}')
+
     recording_id = self._next_recording_id
     self._recordings[recording_id] = interface.Recording(
         id=recording_id,
@@ -289,12 +315,18 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
     self._next_recording_id += 1
     return recording_id
 
-  def get_recording(self, recording_id: int) -> interface.Recording:
+  def get_recording(
+      self,
+      recording_id: int,
+  ) -> interface.Recording:
     """Get a recording from the database."""
+    recording_id = int(recording_id)
     return self._recordings[recording_id]
 
   def remove_recording(self, recording_id: int) -> None:
     """Remove a recording from the database."""
+
+    recording_id = int(recording_id)
 
     remove_window_ids = [
         window.id
@@ -303,12 +335,21 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
     ]
     for window_id in remove_window_ids:
       self.remove_window(window_id)
+
+    remove_annotation_ids = [
+        annotation.id
+        for annotation in self._annotations.values()
+        if annotation.recording_id == recording_id
+    ]
+    for annotation_id in remove_annotation_ids:
+      self.remove_annotation(annotation_id)
+
     del self._recordings[recording_id]
 
   def insert_window(
       self,
       recording_id: int,
-      offsets: np.ndarray,
+      offsets: list[float],
       embedding: np.ndarray | None = None,
       **kwargs: Any,
   ) -> int:
@@ -335,6 +376,7 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
   ) -> interface.Window:
     """Get a window from the database."""
 
+    window_id = int(window_id)
     window = self._windows[window_id]
 
     if include_embedding:
@@ -346,23 +388,18 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
 
   def get_embedding(self, window_id: int) -> np.ndarray:
     """Get an embedding vector from the database."""
+    window_id = int(window_id)
     return self._windows[window_id].embedding
 
   def remove_window(self, window_id: int) -> None:
     """Remove a window from the database."""
-
-    remove_annotation_ids = [
-        annotation.id
-        for annotation in self._annotations.values()
-        if annotation.window_id == window_id
-    ]
-    for annotation_id in remove_annotation_ids:
-      self.remove_annotation(annotation_id)
+    window_id = int(window_id)
     del self._windows[window_id]
 
   def insert_annotation(
       self,
-      window_id: int,
+      recording_id: int,
+      offsets: list[float],
       label: str,
       label_type: interface.LabelType,
       provenance: str,
@@ -371,13 +408,20 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
   ) -> int:
     """Insert an annotation into the database."""
 
-    if window_id not in self._windows:
-      raise ValueError(f'Window id not found: {window_id}')
+    if recording_id not in self._recordings:
+      raise ValueError(f'Recording id not found: {recording_id}')
 
     if skip_duplicates:
       matches = self.get_all_annotations(
           config_dict.create(
-              eq=dict(window_id=window_id, label=label, label_type=label_type)
+              eq=dict(
+                  recording_id=recording_id,
+                  label=label,
+                  label_type=label_type,
+              ),
+              approx=dict(
+                  offsets=offsets,
+              ),
           )
       )
       if matches:
@@ -386,7 +430,8 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
     annotation_id = self._next_annotation_id
     self._annotations[annotation_id] = interface.Annotation(
         id=annotation_id,
-        window_id=window_id,
+        recording_id=recording_id,
+        offsets=offsets,
         label=label,
         label_type=label_type,
         provenance=provenance,
@@ -397,10 +442,12 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
 
   def get_annotation(self, annotation_id: int) -> interface.Annotation:
     """Get an annotation from the database."""
+    annotation_id = int(annotation_id)
     return self._annotations[annotation_id]
 
   def remove_annotation(self, annotation_id: int) -> None:
     """Remove an annotation from the database."""
+    annotation_id = int(annotation_id)
     del self._annotations[annotation_id]
 
   def count_embeddings(self) -> int:
@@ -471,9 +518,21 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
           self._annotations,
           annotations_filter,
       )
-      restrict_windows &= {
-          self._annotations[annotation_id].window_id
+      restrict_recording_offsets = {
+          (
+              self._annotations[annotation_id].recording_id,
+              tuple(self._annotations[annotation_id].offsets),
+          )
           for annotation_id in restrict_annotations
+      }
+      restrict_windows = {
+          window_id
+          for window_id in restrict_windows
+          if (
+              self._windows[window_id].recording_id,
+              tuple(self._windows[window_id].offsets),
+          )
+          in restrict_recording_offsets
       }
 
     # Return the window IDs that match the constraints.
@@ -544,14 +603,14 @@ class InMemoryGraphSearchDB(interface.HopliteDBInterface):
   ) -> collections.Counter[str]:
     """Count each label in the database, ignoring provenance."""
 
-    # Avoid double-counting the same label on the same window because of
-    # different provenances.
+    # Avoid double-counting the same label on the same recording offsets because
+    # of different provenances.
     unique_annotations = {
-        (a.window_id, a.label, a.label_type)
+        (a.recording_id, tuple(a.offsets), a.label, a.label_type)
         for a in self._annotations.values()
         if label_type is None or a.label_type == label_type
     }
-    return collections.Counter([a[1] for a in unique_annotations])
+    return collections.Counter([a[2] for a in unique_annotations])
 
   def get_embedding_dim(self) -> int:
     """Get the embedding dimension."""

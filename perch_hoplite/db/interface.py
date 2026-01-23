@@ -217,7 +217,7 @@ class Window(DynamicInfo):
 
   id: int
   recording_id: int
-  offsets: np.ndarray
+  offsets: list[float]
   embedding: np.ndarray | None
 
 
@@ -232,7 +232,8 @@ class Annotation(DynamicInfo):
   """Annotation info."""
 
   id: int
-  window_id: int
+  recording_id: int
+  offsets: list[float]
   label: str
   label_type: LabelType
   provenance: str
@@ -284,6 +285,9 @@ class HopliteDBInterface(abc.ABC):
       - column: [value1, value2, value3, ...]
     - range => to test if given column is between two values
       - column: [value1, value2]
+    - approx => to test if given column is approximately equal to given value
+                (within 1e-6 difference); useful for floating point comparisons
+      - column: value
 
   The recommended way to build such ConfigDict filters is to use something like
   this (feel free to omit operations that are not needed):
@@ -300,6 +304,7 @@ class HopliteDBInterface(abc.ABC):
       isin=dict(column=[value1, value2, value3]),
       notin=dict(column=[value1, value2, value3]),
       range=dict(column=[value1, value2]),
+      approx=dict(column=value),
   )
   ```
   """
@@ -339,6 +344,10 @@ class HopliteDBInterface(abc.ABC):
   @abc.abstractmethod
   def commit(self) -> None:
     """Commit any pending transactions to the database."""
+
+  @abc.abstractmethod
+  def rollback(self) -> None:
+    """Rollback any pending transactions to the database."""
 
   @abc.abstractmethod
   def thread_split(self) -> "HopliteDBInterface":
@@ -463,7 +472,7 @@ class HopliteDBInterface(abc.ABC):
   def insert_window(
       self,
       recording_id: int,
-      offsets: np.ndarray,
+      offsets: list[float],
       embedding: np.ndarray | None = None,
       **kwargs: Any,
   ) -> int:
@@ -479,6 +488,30 @@ class HopliteDBInterface(abc.ABC):
     Returns:
       The ID of the inserted window.
     """
+
+  def insert_windows_batch(
+      self,
+      windows_batch: Sequence[dict[str, Any]],
+      embeddings_batch: np.ndarray | None = None,
+  ) -> Sequence[int]:
+    """Insert a batch of windows into the database.
+
+    Args:
+      windows_batch: A sequence of windows to insert. Each window must be a dict
+        with same keys as the arguments of `insert_window()`, except for the
+        `embedding` argument.
+      embeddings_batch: A batch of embedding vectors for the given windows. If
+        None, no embedding vectors are inserted into the database.
+
+    Returns:
+      A sequence of IDs of the inserted windows.
+    """
+
+    window_ids = []
+    for window_kwargs, embedding in zip(windows_batch, embeddings_batch):
+      window_id = self.insert_window(embedding=embedding, **window_kwargs)
+      window_ids.append(window_id)
+    return window_ids
 
   @abc.abstractmethod
   def get_window(
@@ -508,10 +541,7 @@ class HopliteDBInterface(abc.ABC):
       An embedding vector for the given window ID.
     """
 
-  def get_embeddings_batch(
-      self,
-      window_ids: Sequence[int] | np.ndarray,
-  ) -> np.ndarray:
+  def get_embeddings_batch(self, window_ids: Sequence[int]) -> np.ndarray:
     """Get a batch of embedding vectors from the database.
 
     Args:
@@ -521,7 +551,7 @@ class HopliteDBInterface(abc.ABC):
       A batch of embedding vectors for the given window IDs.
     """
 
-    embeddings = [self.get_embedding(id) for id in window_ids]
+    embeddings = [self.get_embedding(window_id) for window_id in window_ids]
     return np.stack(embeddings)
 
   @abc.abstractmethod
@@ -535,7 +565,8 @@ class HopliteDBInterface(abc.ABC):
   @abc.abstractmethod
   def insert_annotation(
       self,
-      window_id: int,
+      recording_id: int,
+      offsets: list[float],
       label: str,
       label_type: LabelType,
       provenance: str,
@@ -545,14 +576,15 @@ class HopliteDBInterface(abc.ABC):
     """Insert an annotation into the database.
 
     Args:
-      window_id: The ID of the window to which the annotation points.
+      recording_id: The ID of the recording to which the annotation refers to.
+      offsets: The offsets in the recording to which the annotation refers to.
       label: The annotation label.
       label_type: The type of label (e.g. positive or negative).
       provenance: The provenance of the annotation.
-      skip_duplicates: If True and another annotation with the same (window_id,
-        label, label_type) already exists in the database, return the id (or one
-        of the ids) of that matching annotation. Otherwise, the annotation is
-        inserted regardless of duplicates.
+      skip_duplicates: If True and another annotation with the same
+        (recording_id, offsets, label, label_type) already exists in the
+        database, return the id (or one of the ids) of that matching annotation.
+        Otherwise, the annotation is inserted regardless of duplicates.
       **kwargs: Additional keyword arguments to pass to the annotation.
 
     Returns:

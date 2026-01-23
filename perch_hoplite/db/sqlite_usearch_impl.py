@@ -40,6 +40,33 @@ USEARCH_DTYPES = {
 }
 
 
+def adapt_float_list(data: list[float]) -> bytes:
+  return np.array(
+      data,
+      dtype=np.dtype('<f4'),  # little-endian np.float32
+  ).tobytes()
+
+
+def convert_float_list(blob: bytes) -> list[float]:
+  return np.frombuffer(
+      blob,
+      dtype=np.dtype('<f4'),  # little-endian np.float32
+  ).tolist()
+
+
+def approx_float_list(blob: bytes, target: bytes) -> bool:
+  return np.allclose(
+      convert_float_list(blob),
+      convert_float_list(target),
+      rtol=0.0,
+      atol=1e-6,
+  )
+
+
+sqlite3.register_adapter(list, adapt_float_list)
+sqlite3.register_converter('FLOAT_LIST', convert_float_list)
+
+
 def get_default_usearch_config(
     embedding_dim: int,
 ) -> config_dict.ConfigDict:
@@ -51,14 +78,6 @@ def get_default_usearch_config(
   usearch_cfg.expansion_add = 256
   usearch_cfg.expansion_search = 128
   return usearch_cfg
-
-
-def serialize_array(arr: np.ndarray, dtype: type[Any]) -> bytes:
-  return arr.astype(np.dtype(dtype).newbyteorder('<')).tobytes()
-
-
-def deserialize_array(serialized: bytes, dtype: type[Any]) -> np.ndarray:
-  return np.frombuffer(serialized, dtype=np.dtype(dtype).newbyteorder('<'))
 
 
 def is_valid_sql_identifier(name: str) -> bool:
@@ -81,8 +100,6 @@ def normalize_sql_value(value: Any) -> Any:
     return value.value
   elif isinstance(value, dt.datetime):
     return value.isoformat()
-  elif isinstance(value, np.ndarray):
-    return serialize_array(value, np.float32)
   elif isinstance(value, np.integer):
     return int(value)
   elif isinstance(value, np.floating):
@@ -112,6 +129,20 @@ def format_sql_insert_values(
   values = normalize_sql_value(list(kwargs.values()))
 
   return f"({', '.join(columns)})", f"({', '.join(placeholders)})", values
+
+
+def format_sql_update_on_conflict(*args: str) -> str:
+  """Build the update part of ON CONFLICT clauses for INSERT statements."""
+
+  for key in args:
+    if not is_valid_sql_identifier(key):
+      raise ValueError(f'`{key}` is not a valid SQL identifier.')
+
+  if not args:
+    return 'DO NOTHING'
+  else:
+    update_clauses_str = ', '.join([f'{key} = excluded.{key}' for key in args])
+    return f'DO UPDATE SET {update_clauses_str}'
 
 
 def format_sql_where_conditions(
@@ -147,6 +178,7 @@ def format_sql_where_conditions(
       'isin',
       'notin',
       'range',
+      'approx',
   }
 
   conditions = []
@@ -181,6 +213,11 @@ def format_sql_where_conditions(
 
       # Build the current SQL condition.
       if op_name == 'eq':
+        if key == 'offsets':
+          logging.warning(
+              "Do not apply `eq` to the `offsets` unless you know what you're "
+              'doing. Apply `approx` instead to avoid floating point errors.'
+          )
         if value is None:
           conditions.append(f'{column} IS NULL')
         else:
@@ -223,6 +260,12 @@ def format_sql_where_conditions(
           raise ValueError(f'`{op_name}` value must be a list of 2 elements.')
         conditions.append(f'{column} BETWEEN ? AND ?')
         values.extend(value)
+      elif op_name == 'approx':
+        if key == 'offsets':
+          conditions.append(f'APPROX_FLOAT_LIST({column}, ?) = TRUE')
+        else:
+          conditions.append(f'ABS({column} - ?) < 1e-6')
+        values.append(value)
 
   return ' AND '.join(conditions), values
 
@@ -302,6 +345,14 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
     # Enable foreign keys.
     cursor.execute('PRAGMA foreign_keys = ON')
 
+    # Create the metadata table.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hoplite_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """)
+
     # Create the deployments table.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS deployments (
@@ -309,7 +360,8 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
             name TEXT NOT NULL,
             project TEXT NOT NULL,
             latitude REAL,
-            longitude REAL
+            longitude REAL,
+            UNIQUE (name, project)
         )
         """)
 
@@ -319,9 +371,9 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             filename TEXT NOT NULL,
             datetime TEXT,
-            deployment_id INTEGER,
-            FOREIGN KEY (deployment_id) REFERENCES deployments(id)
-            ON DELETE CASCADE
+            deployment_id INTEGER REFERENCES deployments(id) ON DELETE CASCADE,
+            UNIQUE (id, deployment_id),
+            UNIQUE (filename, deployment_id)
         )
         """)
 
@@ -329,10 +381,10 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS windows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            recording_id INTEGER NOT NULL,
-            offsets BLOB NOT NULL,
-            FOREIGN KEY (recording_id) REFERENCES recordings(id)
-            ON DELETE CASCADE
+            recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+            offsets FLOAT_LIST NOT NULL,
+            UNIQUE (id, recording_id, offsets),
+            UNIQUE (recording_id, offsets)
         )
         """)
 
@@ -340,43 +392,23 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS annotations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            window_id INTEGER NOT NULL,
+            recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+            offsets FLOAT_LIST NOT NULL,
             label TEXT NOT NULL,
             label_type INTEGER NOT NULL,
             provenance TEXT NOT NULL,
-            FOREIGN KEY (window_id) REFERENCES windows(id)
-            ON DELETE CASCADE
+            UNIQUE (id, recording_id, offsets)
         )
         """)
 
-    # Create the metadata table.
+    # Create other indexes for efficient lookups.
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS hoplite_metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-        """)
-
-    # Create indexes for efficient lookups.
-    cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_deployments
-        ON deployments(id)
-        """)
-    cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_recordings
-        ON recordings(id, deployment_id)
-        """)
-    cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_windows
-        ON windows(id, recording_id)
-        """)
-    cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_annotations
-        ON annotations(id, window_id)
+        CREATE INDEX IF NOT EXISTS idx_annotations
+        ON annotations(recording_id, offsets, label, label_type, provenance)
         """)
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_labels
-        ON annotations(window_id, label, label_type, provenance)
+        ON annotations(label, label_type, provenance)
         """)
 
   @staticmethod
@@ -419,7 +451,16 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
     db_path = epath.Path(db_path)
     db_path.mkdir(parents=True, exist_ok=True)
     sqlite_path = db_path / HOPLITE_FILENAME
-    db = sqlite3.connect(sqlite_path.as_posix())
+    db = sqlite3.connect(
+        sqlite_path.as_posix(),
+        detect_types=sqlite3.PARSE_DECLTYPES,
+    )
+    db.create_function(
+        name='APPROX_FLOAT_LIST',
+        narg=2,
+        func=approx_float_list,
+        deterministic=True,
+    )
     db.set_trace_callback(
         lambda statement: logging.info('Executed SQL statement: %s', statement)
     )
@@ -519,6 +560,7 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
         ALTER TABLE {table_name}
         ADD COLUMN {column_name} {sql_type[column_type]}
         """)
+    self.commit()
 
     self._extra_table_columns[table_name][column_name] = column_type
 
@@ -535,6 +577,13 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
     if self._ui_updated:
       self.ui.save()
       self._ui_updated = False
+
+  def rollback(self) -> None:
+    """Rollback any pending transactions to the database."""
+    self.db.rollback()
+    if self._cursor is not None:
+      self._cursor.close()
+      self._cursor = None
 
   def thread_split(self) -> 'SQLiteUSearchDB':
     """Get a new instance of the SQLite DB."""
@@ -627,21 +676,30 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
         longitude=longitude,
         **kwargs,
     )
+    update_clause_str = format_sql_update_on_conflict(
+        'latitude',
+        'longitude',
+        *self._extra_table_columns['deployments'].keys(),
+    )
     cursor.execute(
         f"""
         INSERT INTO deployments {columns_str}
         VALUES {placeholders_str}
+        ON CONFLICT (name, project)
+        {update_clause_str}
         """,
         values,
     )
 
     deployment_id = cursor.lastrowid
     if deployment_id is None:
-      raise RuntimeError('Error inserting deployment into the database.')
+      raise RuntimeError('Error inserting the deployment into the database.')
     return deployment_id
 
   def get_deployment(self, deployment_id: int) -> interface.Deployment:
     """Get a deployment from the database."""
+
+    deployment_id = int(deployment_id)
 
     cursor = self._get_cursor()
     cursor.execute(
@@ -662,8 +720,20 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
   def remove_deployment(self, deployment_id: int) -> None:
     """Remove a deployment from the database."""
 
-    # TODO(stefanistrate): Make sure to remove corresponding embeddings from
-    # USearch if removing this deployment triggers window removals.
+    deployment_id = int(deployment_id)
+
+    remove_window_ids = self.match_window_ids(
+        deployments_filter=config_dict.create(
+            eq=dict(deployment_id=deployment_id)
+        )
+    )
+    if remove_window_ids:
+      if not self._ui_loaded:
+        self.ui.load()
+        self._ui_loaded = True
+      self.ui.remove(remove_window_ids)
+      self._ui_updated = True
+
     cursor = self._get_cursor()
     cursor.execute(
         """
@@ -691,21 +761,38 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
         deployment_id=deployment_id,
         **kwargs,
     )
-    cursor.execute(
-        f"""
-        INSERT INTO recordings {columns_str}
-        VALUES {placeholders_str}
-        """,
-        values,
+    update_clause_str = format_sql_update_on_conflict(
+        'datetime',
+        *self._extra_table_columns['recordings'].keys(),
     )
+    try:
+      cursor.execute(
+          f"""
+          INSERT INTO recordings {columns_str}
+          VALUES {placeholders_str}
+          ON CONFLICT (filename, deployment_id)
+          {update_clause_str}
+          """,
+          values,
+      )
+    except sqlite3.Error as e:
+      if e.sqlite_errorname == 'SQLITE_CONSTRAINT_FOREIGNKEY':
+        custom_msg = 'Check that the deployment_id exists.'
+      else:
+        custom_msg = ''
+      raise RuntimeError(
+          f'Error inserting the recording into the database. {custom_msg}'
+      ) from e
 
     recording_id = cursor.lastrowid
     if recording_id is None:
-      raise RuntimeError('Error inserting recording into the database.')
+      raise RuntimeError('Error inserting the recording into the database.')
     return recording_id
 
   def get_recording(self, recording_id: int) -> interface.Recording:
     """Get a recording from the database."""
+
+    recording_id = int(recording_id)
 
     cursor = self._get_cursor()
     cursor.execute(
@@ -729,8 +816,18 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
   def remove_recording(self, recording_id: int) -> None:
     """Remove a recording from the database."""
 
-    # TODO(stefanistrate): Make sure to remove corresponding embeddings from
-    # USearch if removing this recording triggers window removals.
+    recording_id = int(recording_id)
+
+    remove_window_ids = self.match_window_ids(
+        recordings_filter=config_dict.create(eq=dict(recording_id=recording_id))
+    )
+    if remove_window_ids:
+      if not self._ui_loaded:
+        self.ui.load()
+        self._ui_loaded = True
+      self.ui.remove(remove_window_ids)
+      self._ui_updated = True
+
     cursor = self._get_cursor()
     cursor.execute(
         """
@@ -745,7 +842,7 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
   def insert_window(
       self,
       recording_id: int,
-      offsets: np.ndarray,
+      offsets: list[float],
       embedding: np.ndarray | None = None,
       **kwargs: Any,
   ) -> int:
@@ -763,17 +860,31 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
         offsets=offsets,
         **kwargs,
     )
-    cursor.execute(
-        f"""
-        INSERT INTO windows {columns_str}
-        VALUES {placeholders_str}
-        """,
-        values,
+    update_clause_str = format_sql_update_on_conflict(
+        *self._extra_table_columns['windows'].keys(),
     )
+    try:
+      cursor.execute(
+          f"""
+          INSERT INTO windows {columns_str}
+          VALUES {placeholders_str}
+          ON CONFLICT (recording_id, offsets)
+          {update_clause_str}
+          """,
+          values,
+      )
+    except sqlite3.Error as e:
+      if e.sqlite_errorname == 'SQLITE_CONSTRAINT_FOREIGNKEY':
+        custom_msg = 'Check that the recording_id exists.'
+      else:
+        custom_msg = ''
+      raise RuntimeError(
+          f'Error inserting the window into the database. {custom_msg}'
+      ) from e
 
     window_id = cursor.lastrowid
     if window_id is None:
-      raise RuntimeError('Error inserting window into the database.')
+      raise RuntimeError('Error inserting the window into the database.')
     if embedding is not None:
       if not self._ui_loaded:
         self.ui.load()
@@ -782,12 +893,44 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
       self._ui_updated = True
     return window_id
 
+  def insert_windows_batch(
+      self,
+      windows_batch: Sequence[dict[str, Any]],
+      embeddings_batch: np.ndarray | None = None,
+  ) -> Sequence[int]:
+    """Insert a batch of windows into the database."""
+
+    if (
+        embeddings_batch is not None
+        and embeddings_batch.shape[-1] != self._embedding_dim
+    ):
+      raise ValueError(
+          f'Incorrect embedding dimension. Expected {self._embedding_dim}, but'
+          f' got {embeddings_batch.shape[-1]}.'
+      )
+
+    window_ids = [
+        self.insert_window(embedding=None, **window_kwargs)
+        for window_kwargs in windows_batch
+    ]
+
+    if embeddings_batch is not None:
+      if not self._ui_loaded:
+        self.ui.load()
+        self._ui_loaded = True
+      self.ui.add(window_ids, embeddings_batch.astype(self._embedding_dtype))
+      self._ui_updated = True
+
+    return window_ids
+
   def get_window(
       self,
       window_id: int,
       include_embedding: bool = False,
   ) -> interface.Window:
     """Get a window from the database."""
+
+    window_id = int(window_id)
 
     cursor = self._get_cursor()
     cursor.execute(
@@ -807,13 +950,14 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
         embedding=None,
         **dict(zip(columns, result)),
     )
-    window.offsets = deserialize_array(window.offsets, np.float32)
     if include_embedding:
       window.embedding = self.get_embedding(window_id)
     return window
 
   def get_embedding(self, window_id: int) -> np.ndarray:
     """Get an embedding vector from the database."""
+
+    window_id = int(window_id)
 
     found = self.ui.contains(window_id)
     if not isinstance(found, bool):
@@ -833,12 +977,9 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
 
   def get_embeddings_batch(
       self,
-      window_ids: Sequence[int] | np.ndarray,
+      window_ids: Sequence[int],
   ) -> np.ndarray:
     """Get a batch of embedding vectors from the database."""
-
-    if not isinstance(window_ids, np.ndarray):
-      window_ids = np.array(window_ids, dtype=np.int32)
 
     found = self.ui.contains(window_ids)
     if not isinstance(found, np.ndarray):
@@ -849,7 +990,7 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
     if not np.all(found):
       raise KeyError(
           'Embedding vectors not found for window ids:'
-          f' {window_ids[~found].tolist()}'
+          f' {itertools.compress(window_ids, ~found)}'
       )
     embeddings_batch = self.ui.get(window_ids)
     if not isinstance(embeddings_batch, np.ndarray):
@@ -861,6 +1002,8 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
 
   def remove_window(self, window_id: int) -> None:
     """Remove a window from the database."""
+
+    window_id = int(window_id)
 
     cursor = self._get_cursor()
     cursor.execute(
@@ -881,7 +1024,8 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
 
   def insert_annotation(
       self,
-      window_id: int,
+      recording_id: int,
+      offsets: list[float],
       label: str,
       label_type: interface.LabelType,
       provenance: str,
@@ -893,7 +1037,10 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
     if skip_duplicates:
       matches = self.get_all_annotations(
           filter=config_dict.create(
-              eq=dict(window_id=window_id, label=label, label_type=label_type)
+              eq=dict(
+                  recording_id=recording_id, label=label, label_type=label_type
+              ),
+              approx=dict(offsets=offsets),
           )
       )
       if matches:
@@ -901,27 +1048,39 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
 
     cursor = self._get_cursor()
     columns_str, placeholders_str, values = format_sql_insert_values(
-        window_id=window_id,
+        recording_id=recording_id,
+        offsets=offsets,
         label=label,
         label_type=label_type,
         provenance=provenance,
         **kwargs,
     )
-    cursor.execute(
-        f"""
-        INSERT INTO annotations {columns_str}
-        VALUES {placeholders_str}
-        """,
-        values,
-    )
+    try:
+      cursor.execute(
+          f"""
+          INSERT INTO annotations {columns_str}
+          VALUES {placeholders_str}
+          """,
+          values,
+      )
+    except sqlite3.Error as e:
+      if e.sqlite_errorname == 'SQLITE_CONSTRAINT_FOREIGNKEY':
+        custom_msg = 'Check that the recording_id exists.'
+      else:
+        custom_msg = ''
+      raise RuntimeError(
+          f'Error inserting the annotation into the database. {custom_msg}'
+      ) from e
 
     annotation_id = cursor.lastrowid
     if annotation_id is None:
-      raise RuntimeError('Error inserting annotation into the database.')
+      raise RuntimeError('Error inserting the annotation into the database.')
     return cursor.lastrowid
 
   def get_annotation(self, annotation_id: int) -> interface.Annotation:
     """Get an annotation from the database."""
+
+    annotation_id = int(annotation_id)
 
     cursor = self._get_cursor()
     cursor.execute(
@@ -943,6 +1102,8 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
 
   def remove_annotation(self, annotation_id: int) -> None:
     """Remove an annotation from the database."""
+
+    annotation_id = int(annotation_id)
 
     cursor = self._get_cursor()
     cursor.execute(
@@ -976,35 +1137,28 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
     cursor = self._get_cursor()
 
     # Pick which tables need to be queried.
-    query_tables = set()
+    query_tables = {'windows'}
     if annotations_filter:
       query_tables |= {'annotations'}
-    if windows_filter:
-      query_tables |= {'windows'}
     if recordings_filter:
-      query_tables |= {'windows', 'recordings'}
+      query_tables |= {'recordings'}
     if deployments_filter:
-      query_tables |= {'windows', 'recordings', 'deployments'}
-    if not any([
-        annotations_filter,
-        windows_filter,
-        recordings_filter,
-        deployments_filter,
-    ]):
-      query_tables = {'windows'}
+      query_tables |= {'recordings', 'deployments'}
 
     # Build the `SELECT ... FROM ... [JOIN ...]` part of the SQL query.
     if 'annotations' in query_tables:
-      select_clause = 'SELECT DISTINCT annotations.window_id'
-      from_clause = 'FROM annotations'
+      select_clause = 'SELECT DISTINCT windows.id'
     else:
       select_clause = 'SELECT windows.id'
-      from_clause = 'FROM windows'
-    if 'annotations' in query_tables and 'windows' in query_tables:
-      from_clause += ' JOIN windows ON annotations.window_id = windows.id'
-    if 'windows' in query_tables and 'recordings' in query_tables:
+    from_clause = 'FROM windows'
+    if 'annotations' in query_tables:
+      from_clause += (
+          ' JOIN annotations ON windows.recording_id = annotations.recording_id'
+          ' AND APPROX_FLOAT_LIST(windows.offsets, annotations.offsets) = TRUE'
+      )
+    if 'recordings' in query_tables:
       from_clause += ' JOIN recordings ON windows.recording_id = recordings.id'
-    if 'recordings' in query_tables and 'deployments' in query_tables:
+    if 'deployments' in query_tables:
       from_clause += (
           ' JOIN deployments ON recordings.deployment_id = deployments.id'
       )
@@ -1135,7 +1289,6 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
           embedding=None,
           **dict(zip(columns, result)),
       )
-      window.offsets = deserialize_array(window.offsets, np.float32)
       if include_embedding:
         window.embedding = self.get_embedding(window.id)
       windows.append(window)
@@ -1208,12 +1361,12 @@ class SQLiteUSearchDB(interface.HopliteDBInterface):
       where_clause = f'WHERE {conditions_str}' if conditions_str else ''
 
     # Subselect with DISTINCT is needed to avoid double-counting the same label
-    # on the same window because of different provenances.
+    # on the same recording offsets because of different provenances.
     cursor.execute(
         f"""
         SELECT label, COUNT(*)
         FROM (
-            SELECT DISTINCT window_id, label, label_type
+            SELECT DISTINCT recording_id, offsets, label, label_type
             FROM annotations
             {where_clause}
         )
