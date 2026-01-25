@@ -372,14 +372,22 @@ class EmbedWorker:
         for result in got:
           if result is None:
             continue
+          window_infos = []
+          embeddings = []
           for source, offsets, embedding in zip(*result):
             source_id = source.to_id()
             recording_id = source_id_to_recording_id[source_id]
+            window_infos.append(dict(recording_id=recording_id, offsets=offsets))
+            embeddings.append(embedding)
             self.db.insert_window(
                 recording_id=recording_id,
                 embedding=embedding,
                 offsets=offsets,
             )
+          self.db.insert_windows_batch(
+            windows_batch=window_infos,
+            embeddings_batch=np.stack(embeddings),
+          )
 
     # Commit all changes for windows to the database.
     self.db.commit()
