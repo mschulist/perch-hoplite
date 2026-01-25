@@ -23,6 +23,7 @@ from ml_collections import config_dict
 from perch_hoplite import audio_io
 from perch_hoplite.db import interface as hoplite_interface
 import tqdm
+import soundfile
 
 
 @dataclasses.dataclass
@@ -149,6 +150,20 @@ class AudioSources(hoplite_interface.HopliteConfig):
 
       for filepath in tqdm.tqdm(filepaths):
         file_id = filepath.as_posix()[len(base_path.as_posix()) + 1 :]
+        # shortcut when not sharding and no min audio length
+        if shard_len_s is None and glob.min_audio_len_s <= 1:
+           with epath.Path(filepath).open('rb') as f:
+            sample_rate_hz = soundfile.SoundFile(f).samplerate
+            yield SourceId(
+              dataset_name=glob.dataset_name,
+              file_id=file_id,
+              offset_s=0,
+              shard_len_s=-1,
+              filepath=filepath.as_posix(),
+              sample_rate_hz=sample_rate_hz,
+            )
+            continue
+
         audio_len_s, sample_rate_hz = (
             audio_io.get_file_length_s_and_sample_rate(filepath)
         )
