@@ -2,16 +2,6 @@
 
 ![CI](https://github.com/google-research/perch-hoplite/actions/workflows/ci_uv.yml/badge.svg)
 
-> **Note:** Hoplite is currently going through a major API redesign and some
-> parts are still moving.
->
-> For non-critical work or if you want to see what's coming, try the latest code
-> from this repo.
->
-> If you've used Hoplite before, make sure you only install `perch-hoplite<1.0`
-> for now, and wait for this note to be removed. We are aiming to release a
-> stable version 1.0.0 in January 2026.
-
 Hoplite is a system for storing large volumes of embeddings from machine
 perception models. We focus on combining vector search with active learning
 workflows, aka [agile modeling](https://arxiv.org/abs/2505.03071).
@@ -106,9 +96,19 @@ python -m unittest discover -s perch_hoplite/agile/tests -p "*test.py"
 
 ### Notes on Dependencies
 
-For GPU support, you can install GPU-enabled tensorflow instead of the default
-CPU version *before* installing `perch-hoplite`. See tensorflow documentation
-for instructions relative to your CUDA version.
+Tensorflow is required for agile modeling (classifier training) and for using
+the [Perch](https://www.kaggle.com/models/google/bird-vocalization-classifier)
+or [BirdNET](https://birdnet.cornell.edu/) models, but is not installed by
+default. We recommend installing one of the Tensorflow options:
+
+To install with Tensorflow (CPU version):
+```bash
+pip install 'perch-hoplite[tf]'
+```
+To install with Tensorflow with CUDA support (for GPU usage):
+```bash
+pip install 'perch-hoplite[tf-cuda]'
+```
 
 The `zoo` library contains wrappers for various bioacoustic models. Some of
 these require JAX. To install with JAX dependencies:
@@ -119,6 +119,8 @@ or with pip:
 ```bash
 pip install 'perch-hoplite[jax]'
 ```
+If installing with uv in editable mode, you can use
+`uv pip install -e '.[tf,jax]'`.
 
 ## Disclaimer
 
