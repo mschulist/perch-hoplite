@@ -23,7 +23,6 @@ from ml_collections import config_dict
 from perch_hoplite import audio_io
 from perch_hoplite.db import interface as hoplite_interface
 import tqdm
-import soundfile
 
 
 @dataclasses.dataclass
@@ -39,6 +38,13 @@ class SourceId:
 
   def to_id(self):
     return f'{self.dataset_name}:{self.file_id}:{self.offset_s}'
+
+  def deployment_name_from_file_id(self) -> str:
+    """Returns the deployment name for this source."""
+    if '/' in self.file_id:
+      return self.file_id.split('/')[0]
+    else:
+      return self.dataset_name
 
 
 @dataclasses.dataclass
@@ -79,6 +85,9 @@ class AudioSources(hoplite_interface.HopliteConfig):
   """A collection of AudioSourceConfig, with SourceId iterator."""
 
   audio_globs: tuple[AudioSourceConfig, ...]
+  _file_info_cache: dict[str, tuple[float, int]] = dataclasses.field(
+      default_factory=dict, repr=False, hash=False
+  )
 
   def __post_init__(self):
     dataset_names = set(
@@ -124,6 +133,19 @@ class AudioSources(hoplite_interface.HopliteConfig):
         )
     return AudioSources(tuple(other_globs.values()))
 
+  def _get_audio_len_s_and_sample_rate_hz(
+      self, filepath: epath.Path
+  ) -> tuple[float, int]:
+    """Returns the audio length and sample rate of the audio file."""
+    filepath_posix = filepath.as_posix()
+    if filepath_posix in self._file_info_cache:
+      return self._file_info_cache[filepath_posix]
+    audio_len_s, sample_rate_hz = audio_io.get_file_length_s_and_sample_rate(
+        filepath_posix
+    )
+    self._file_info_cache[filepath_posix] = (audio_len_s, sample_rate_hz)
+    return audio_len_s, sample_rate_hz
+
   def iterate_all_sources(
       self,
       target_dataset_name: str | None = None,
@@ -150,22 +172,8 @@ class AudioSources(hoplite_interface.HopliteConfig):
 
       for filepath in tqdm.tqdm(filepaths):
         file_id = filepath.as_posix()[len(base_path.as_posix()) + 1 :]
-        # shortcut when not sharding and no min audio length
-        if shard_len_s is None and glob.min_audio_len_s <= 1:
-           with epath.Path(filepath).open('rb') as f:
-            sample_rate_hz = soundfile.SoundFile(f).samplerate
-            yield SourceId(
-              dataset_name=glob.dataset_name,
-              file_id=file_id,
-              offset_s=0,
-              shard_len_s=-1,
-              filepath=filepath.as_posix(),
-              sample_rate_hz=sample_rate_hz,
-            )
-            continue
-
-        audio_len_s, sample_rate_hz = (
-            audio_io.get_file_length_s_and_sample_rate(filepath)
+        audio_len_s, sample_rate_hz = self._get_audio_len_s_and_sample_rate_hz(
+            filepath
         )
         if shard_len_s is None:
           yield SourceId(
